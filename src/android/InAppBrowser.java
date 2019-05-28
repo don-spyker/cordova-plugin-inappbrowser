@@ -33,7 +33,9 @@ import android.graphics.drawable.Drawable;
 import android.graphics.PorterDuff;
 import android.graphics.PorterDuffColorFilter;
 import android.graphics.Color;
+import android.net.http.SslError;
 import android.net.Uri;
+import android.os.AsyncTask;
 import android.os.Build;
 import android.os.Bundle;
 import android.text.InputType;
@@ -57,6 +59,8 @@ import android.webkit.WebResourceResponse;
 import android.webkit.WebSettings;
 import android.webkit.WebView;
 import android.webkit.WebViewClient;
+import android.webkit.SslErrorHandler;
+import android.widget.Button;
 import android.widget.EditText;
 import android.widget.ImageButton;
 import android.widget.ImageView;
@@ -76,14 +80,30 @@ import org.apache.cordova.PluginResult;
 import org.json.JSONException;
 import org.json.JSONObject;
 
+import java.io.FileInputStream;
+import java.io.FileNotFoundException;
+import java.io.IOException;
+import java.io.InputStream;
 import java.lang.reflect.InvocationTargetException;
 import java.lang.reflect.Field;
 import java.lang.reflect.Method;
+import java.net.URL;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.List;
 import java.util.HashMap;
 import java.util.StringTokenizer;
+import java.security.KeyManagementException;
+import java.security.KeyStore;
+import java.security.KeyStoreException;
+import java.security.NoSuchAlgorithmException;
+import java.security.cert.Certificate;
+import java.security.cert.CertificateException;
+import java.security.cert.CertificateFactory;
+import java.security.cert.X509Certificate;
+import javax.net.ssl.HttpsURLConnection;
+import javax.net.ssl.SSLContext;
+import javax.net.ssl.TrustManagerFactory;
 
 @SuppressLint("SetJavaScriptEnabled")
 public class InAppBrowser extends CordovaPlugin {
@@ -169,6 +189,16 @@ public class InAppBrowser extends CordovaPlugin {
             final HashMap<String, String> features = parseFeature(args.optString(2));
 
             LOG.d(LOG_TAG, "target = " + target);
+            LOG.d(LOG_TAG, "url = " + url);
+
+                if(url.startsWith("https:")) {
+                // Trust any supplied certificate for SSL connections
+                try {
+                    addTrustedCA();
+                } catch (Exception e) {
+                    LOG.d(LOG_TAG, "Unable to add trusted CA: " + e.toString());
+                }
+            }
 
             this.cordova.getActivity().runOnUiThread(new Runnable() {
                 @Override
@@ -1135,6 +1165,48 @@ public class InAppBrowser extends CordovaPlugin {
         }
     }
 
+    private void addTrustedCA() throws IOException, NoSuchAlgorithmException, CertificateException, KeyManagementException, KeyStoreException {
+        LOG.d(LOG_TAG, "Adding trusted certificate if it exists");
+        // Load CAs from an InputStream
+        // (could be from a resource or ByteArrayInputStream or ...)
+        CertificateFactory cf = CertificateFactory.getInstance("X.509");
+        InputStream caInput;
+        try {
+            caInput = this.cordova.getActivity().getAssets().open("www/trusted-ca.der");
+        } catch (IOException ex) {
+            LOG.d(LOG_TAG, "No trusted certificate authorities supplied: " + ex.toString());
+            return;
+        }
+        LOG.d(LOG_TAG, "Found trusted certificate");
+        Certificate ca;
+        try {
+            ca = cf.generateCertificate(caInput);
+            LOG.d(LOG_TAG, "ca=" + ((X509Certificate) ca).getSubjectDN());
+        } finally {
+            caInput.close();
+        }
+
+         // Create a KeyStore containing our trusted CAs
+        String keyStoreType = KeyStore.getDefaultType();
+        KeyStore keyStore = KeyStore.getInstance(keyStoreType);
+        keyStore.load(null, null);
+        keyStore.setCertificateEntry("ca", ca);
+
+         // Create a TrustManager that trusts the CAs in our KeyStore
+        String tmfAlgorithm = TrustManagerFactory.getDefaultAlgorithm();
+        TrustManagerFactory tmf = TrustManagerFactory.getInstance(tmfAlgorithm);
+        tmf.init(keyStore);
+
+         // Create an SSLContext that uses our TrustManager
+        SSLContext context = SSLContext.getInstance("TLS");
+        context.init(null, tmf.getTrustManagers(), null);
+
+         // Set up HttpsURLConnection so that default SSL connections use the
+        // socket factory we've made that trusts our certificate authority
+        LOG.d(LOG_TAG, "Setting the default SSLSocketFactory");
+        HttpsURLConnection.setDefaultSSLSocketFactory(context.getSocketFactory());
+    }
+
     /**
      * The webview client receives notifications about appView
      */
@@ -1143,6 +1215,8 @@ public class InAppBrowser extends CordovaPlugin {
         CordovaWebView webView;
         String beforeload;
         boolean waitForBeforeload;
+        String currentUrl;
+        ArrayList<String> whiteList;
 
         /**
          * Constructor.
@@ -1155,6 +1229,8 @@ public class InAppBrowser extends CordovaPlugin {
             this.edittext = mEditText;
             this.beforeload = beforeload;
             this.waitForBeforeload = beforeload != null;
+            this.currentUrl = null;
+            this.whiteList = new ArrayList<String>();
         }
 
         /**
@@ -1483,5 +1559,46 @@ public class InAppBrowser extends CordovaPlugin {
             // By default handle 401 like we'd normally do!
             super.onReceivedHttpAuthRequest(view, handler, host, realm);
         }
+
+        /**
+         * Ignore SSL Certificate errors when the certificate is good with HttpsUrlConnection
+         */
+        @Override
+        public void onReceivedSslError(WebView view, SslErrorHandler handler, SslError error) {
+            LOG.d(LOG_TAG, "We have received an SSL error on this URL: " + error.getUrl());
+            int endIndex = error.getUrl().indexOf("/", 8);
+            endIndex = endIndex == -1 ? (error.getUrl().length() - 1) : endIndex;
+            this.currentUrl = "https://" + error.getUrl().substring(8, endIndex);
+            LOG.d(LOG_TAG, "We will verify the certificate on this URL: " + this.currentUrl);
+            if(this.whiteList.contains(this.currentUrl)) {
+                LOG.d(LOG_TAG, "Already found the url in the white list, no need to verify it again");
+                handler.proceed();
+            } else {
+                LOG.d(LOG_TAG, "The https url was not in the white list, we need to verify it");
+                new CheckSSLTask().execute(handler);
+            }
+        }
+
+        private class CheckSSLTask extends AsyncTask<SslErrorHandler, Void, Void> {
+            protected Void doInBackground(SslErrorHandler... handlers) {
+                try {
+                    HttpsURLConnection con = (HttpsURLConnection) new URL(currentUrl).openConnection();
+                    con.setConnectTimeout(5000);
+                    con.connect();
+                } catch (Exception ex) {
+                    LOG.e(LOG_TAG, "Error with the site certificate: " + ex.toString());
+                    handlers[0].cancel();
+                }
+                // We have verified the certificate used by the site is trusted,
+                // white list the url and proceed to load the page
+                whiteList.add(currentUrl);
+                handlers[0].proceed();
+                return null;
+            }
+
+             protected void onPostExecute() {
+                currentUrl = null;
+            }
+        }	        
     }
 }
